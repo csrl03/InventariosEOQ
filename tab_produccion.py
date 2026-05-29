@@ -534,6 +534,164 @@ class _ExplotarBOMDialog(tk.Toplevel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Simulación de Consumo por Período (clientes + BOM + ceil)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _TabSimulacionBOM(ttk.Frame):
+    """
+    Simula el consumo de componentes por período basado en:
+      • La demanda anual registrada en cliente_consumo (productos finales por cliente)
+      • La explosión de BOM de cada producto (math.ceil en cada nivel)
+
+    Muestra una tabla: Período | Producto | Componente | Demanda Período | Cant. Requerida (↑)
+    y permite filtrar por período o por SKU de componente.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.rowconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
+        self._resultado = []
+        self._build()
+
+    def _build(self):
+        # ── Controles superiores ──────────────────────────────────────────
+        ctrl = ttk.Frame(self)
+        ctrl.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+
+        ttk.Label(ctrl, text="Períodos :", style="In.TLabel").pack(side="left", padx=(4, 2))
+        self.vPeriodos = tk.StringVar(value="12")
+        ttk.Entry(ctrl, textvariable=self.vPeriodos, width=5, style="In.TEntry").pack(
+            side="left", padx=2)
+
+        ttk.Label(ctrl, text="Tipo :", style="In.TLabel").pack(side="left", padx=(8, 2))
+        self.vTipo = tk.StringVar(value="mes")
+        ttk.Combobox(ctrl, textvariable=self.vTipo, values=["mes", "semana"],
+                     state="readonly", width=8).pack(side="left", padx=2)
+
+        b_sim = ttk.Button(ctrl, text="▶ Simular", style="Acc.TButton",
+                           command=self._simular)
+        b_sim.pack(side="left", padx=8)
+        tip(b_sim, "Calcula el consumo de componentes por período usando\n"
+                   "la demanda de clientes + explosión de BOM (ceil).")
+
+        ttk.Label(ctrl, text="Filtrar período :", style="In.TLabel").pack(side="left", padx=(8, 2))
+        self.vFilPer = tk.StringVar(value="")
+        ttk.Entry(ctrl, textvariable=self.vFilPer, width=5, style="In.TEntry").pack(
+            side="left", padx=2)
+
+        ttk.Label(ctrl, text="Componente :", style="In.TLabel").pack(side="left", padx=(8, 2))
+        self.vFilComp = tk.StringVar(value="")
+        ttk.Entry(ctrl, textvariable=self.vFilComp, width=12, style="In.TEntry").pack(
+            side="left", padx=2)
+
+        b_fil = ttk.Button(ctrl, text="🔍 Filtrar", command=self._filtrar)
+        b_fil.pack(side="left", padx=4)
+        tip(b_fil, "Filtrar resultados por número de período o código de componente.")
+
+        b_exp = ttk.Button(ctrl, text="💾 Exportar CSV", command=self._exportar)
+        b_exp.pack(side="right", padx=6)
+        tip(b_exp, "Exportar la simulación a un archivo CSV.")
+
+        # ── Nota informativa ──────────────────────────────────────────────
+        nota = ttk.Label(
+            self,
+            text="  Las cantidades se redondean al entero superior (↑) en cada nivel del BOM. "
+                 "Configure clientes en Maestro → Clientes → 📋 Consumo de Productos.",
+            style="Dim.TLabel",
+        )
+        nota.grid(row=1, column=0, sticky="w", padx=6, pady=(0, 2))
+
+        # ── Treeview de resultados ────────────────────────────────────────
+        COLS = ("Período", "Producto", "Desc. Producto", "Dem./Período",
+                "Componente", "Desc. Componente", "Cant. Req. (↑)", "Unidad", "Nivel")
+        frm_tv, self._tv = make_treeview(self, COLS)
+        frm_tv.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 4))
+        self._tv.column("Período",         width=60)
+        self._tv.column("Producto",        width=85)
+        self._tv.column("Desc. Producto",  width=140)
+        self._tv.column("Dem./Período",    width=90)
+        self._tv.column("Componente",      width=90)
+        self._tv.column("Desc. Componente", width=140)
+        self._tv.column("Cant. Req. (↑)",  width=100)
+        self._tv.column("Unidad",          width=65)
+        self._tv.column("Nivel",           width=50)
+
+        self._lbl_resumen = ttk.Label(self, text="", style="Dim.TLabel")
+        self._lbl_resumen.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 4))
+        self.rowconfigure(2, weight=1)
+
+    def _simular(self):
+        try:
+            n = int(self.vPeriodos.get())
+            if n < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Número de períodos inválido."); return
+
+        consumos = db.get_cliente_consumo()
+        if not consumos:
+            messagebox.showinfo(
+                "Sin datos",
+                "No hay registros en Consumo de Productos.\n"
+                "Vaya a Maestro → Clientes → 📋 Consumo de Productos."
+            ); return
+
+        self._resultado = db.simular_consumo_periodos(n, self.vTipo.get())
+        self._cargar(self._resultado)
+
+    def _cargar(self, filas):
+        self._tv.delete(*self._tv.get_children())
+        for r in filas:
+            self._tv.insert("", "end", values=(
+                r["periodo"],
+                r["sku_codigo"],
+                r["sku_descripcion"],
+                r["demanda_periodo"],
+                r["comp_codigo"],
+                r["comp_descripcion"],
+                r["cantidad_requerida"],
+                r["unidad"],
+                r["nivel"] if r["nivel"] > 0 else "—",
+            ))
+        n_filas = len(filas)
+        periodos = len({r["periodo"] for r in filas})
+        self._lbl_resumen.config(
+            text=f"  {n_filas} fila(s) | {periodos} período(s)"
+        )
+
+    def _filtrar(self):
+        if not self._resultado:
+            return
+        fil_per  = self.vFilPer.get().strip()
+        fil_comp = self.vFilComp.get().strip().lower()
+        filtrado = self._resultado
+        if fil_per:
+            try:
+                per_n = int(fil_per)
+                filtrado = [r for r in filtrado if r["periodo"] == per_n]
+            except ValueError:
+                pass
+        if fil_comp:
+            filtrado = [r for r in filtrado
+                        if fil_comp in r["comp_codigo"].lower()
+                        or fil_comp in r["comp_descripcion"].lower()]
+        self._cargar(filtrado)
+
+    def _exportar(self):
+        if not self._resultado:
+            messagebox.showinfo("Sin datos", "Ejecute la simulación primero."); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="Exportar Simulación de Consumo"
+        )
+        if path:
+            pd.DataFrame(self._resultado).to_csv(path, index=False)
+            messagebox.showinfo("Exportado", f"Simulación exportada en:\n{path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Tab Producción principal
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -547,11 +705,13 @@ class TabProduccion(ttk.Frame):
         nb = ttk.Notebook(self)
         nb.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        self._tab_mps = _TabMPS(nb)
-        self._tab_bom = _TabBOM(nb)
+        self._tab_mps      = _TabMPS(nb)
+        self._tab_bom      = _TabBOM(nb)
+        self._tab_sim_bom  = _TabSimulacionBOM(nb)
 
-        nb.add(self._tab_mps, text="  📋 MPS  ")
-        nb.add(self._tab_bom, text="  🌳 BOM  ")
+        nb.add(self._tab_mps,     text="  📋 MPS  ")
+        nb.add(self._tab_bom,     text="  🌳 BOM  ")
+        nb.add(self._tab_sim_bom, text="  📊 Simulación de Consumo  ")
 
     def refresh_all(self):
         self._tab_mps.refresh()

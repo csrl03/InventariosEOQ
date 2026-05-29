@@ -12,6 +12,10 @@ from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 
 import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import database as db
 from gui_utils import C, F_LABEL, F_BOLD, F_SMALL, _entry_row, _flt, make_treeview, SimpleDialog, tip
@@ -302,6 +306,199 @@ class _TabImportarCSV(ttk.Frame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Proyección de Inventario (stock + pedidos pendientes + demanda clientes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _TabProyeccionInventario(ttk.Frame):
+    """
+    Proyecta el nivel de inventario de un SKU combinando:
+      • Stock actual del SKU
+      • Pedidos pendientes (entradas): fecha_orden + lead_time del proveedor
+      • Demanda de clientes vía cliente_consumo (directa) + BOM derivado (salidas)
+    Todas las cantidades se redondean con math.ceil.
+    Muestra tabla y gráfica matplotlib de la proyección período a período.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.rowconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
+        self._fig    = None
+        self._canvas = None
+        self._proyeccion = []
+        self._build()
+
+    def _build(self):
+        # ── Controles superiores ──────────────────────────────────────────
+        ctrl = ttk.Frame(self)
+        ctrl.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+
+        ttk.Label(ctrl, text="SKU :", style="In.TLabel").pack(side="left", padx=(4, 2))
+        self._skus = db.get_skus()
+        self._sku_labels = [f"{s['codigo']} — {s['descripcion']}" for s in self._skus]
+        self._sku_ids    = [s["id"] for s in self._skus]
+        self.vSKU = tk.StringVar(value=self._sku_labels[0] if self._sku_labels else "")
+        self._cb_sku = ttk.Combobox(ctrl, textvariable=self.vSKU,
+                                     values=self._sku_labels, state="readonly", width=26)
+        self._cb_sku.pack(side="left", padx=2)
+
+        ttk.Label(ctrl, text="Períodos :", style="In.TLabel").pack(side="left", padx=(8, 2))
+        self.vPeriodos = tk.StringVar(value="12")
+        ttk.Entry(ctrl, textvariable=self.vPeriodos, width=5, style="In.TEntry").pack(
+            side="left", padx=2)
+
+        ttk.Label(ctrl, text="Tipo :", style="In.TLabel").pack(side="left", padx=(8, 2))
+        self.vTipo = tk.StringVar(value="mes")
+        ttk.Combobox(ctrl, textvariable=self.vTipo, values=["mes", "semana"],
+                     state="readonly", width=8).pack(side="left", padx=2)
+
+        b_proy = ttk.Button(ctrl, text="📈 Proyectar", style="Acc.TButton",
+                             command=self._proyectar)
+        b_proy.pack(side="left", padx=8)
+        tip(b_proy, "Calcula la proyección de inventario período a período\n"
+                    "usando pedidos pendientes y demanda de clientes (ceil).")
+
+        b_exp = ttk.Button(ctrl, text="💾 Exportar CSV", command=self._exportar)
+        b_exp.pack(side="right", padx=6)
+        tip(b_exp, "Exportar la proyección a un archivo CSV.")
+
+        # ── Nota ──────────────────────────────────────────────────────────
+        nota = ttk.Label(
+            self,
+            text="  Entradas: pedidos pendientes con lead time del proveedor. "
+                 "Salidas: demanda directa (cliente_consumo) + derivada (BOM). "
+                 "Cantidades redondeadas con ceil.",
+            style="Dim.TLabel",
+        )
+        nota.grid(row=1, column=0, sticky="w", padx=6, pady=(0, 2))
+
+        # ── Panel dividido: tabla izquierda | gráfica derecha ─────────────
+        panel = ttk.Frame(self)
+        panel.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 4))
+        panel.rowconfigure(0, weight=1)
+        panel.columnconfigure(0, weight=0)
+        panel.columnconfigure(1, weight=1)
+
+        # Tabla
+        COLS = ("Período", "Stock Inicial", "Entradas (↑)", "Salidas (↑)", "Stock Final")
+        frm_tv, self._tv = make_treeview(panel, COLS, height=14)
+        frm_tv.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self._tv.column("Período",        width=75)
+        self._tv.column("Stock Inicial",  width=100)
+        self._tv.column("Entradas (↑)",   width=90)
+        self._tv.column("Salidas (↑)",    width=90)
+        self._tv.column("Stock Final",    width=95)
+        self._tv.tag_configure("deficit",  background="#3a1a1a", foreground="#e74c3c")
+        self._tv.tag_configure("normal",   background="#1e3028", foreground="#ecf0f1")
+
+        # Gráfica
+        self._graf_frame = ttk.Frame(panel, style="Panel.TFrame")
+        self._graf_frame.grid(row=0, column=1, sticky="nsew")
+        self._graf_frame.rowconfigure(0, weight=1)
+        self._graf_frame.columnconfigure(0, weight=1)
+
+    def _proyectar(self):
+        if not self._sku_ids:
+            messagebox.showinfo("Sin SKUs", "No hay SKUs registrados."); return
+        try:
+            n = int(self.vPeriodos.get())
+            if n < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Número de períodos inválido."); return
+
+        idx = self._sku_labels.index(self.vSKU.get()) if self.vSKU.get() in self._sku_labels else 0
+        sku_id = self._sku_ids[idx]
+
+        self._skus = db.get_skus()
+        self._sku_labels = [f"{s['codigo']} — {s['descripcion']}" for s in self._skus]
+        self._sku_ids    = [s["id"] for s in self._skus]
+        self._cb_sku["values"] = self._sku_labels
+
+        self._proyeccion = db.proyectar_inventario(sku_id, n, self.vTipo.get())
+        self._cargar_tabla(self._proyeccion)
+        self._graficar(self._proyeccion)
+
+    def _cargar_tabla(self, filas):
+        self._tv.delete(*self._tv.get_children())
+        for r in filas:
+            tag = "deficit" if r["stock_final"] < 0 else "normal"
+            self._tv.insert("", "end", tags=(tag,), values=(
+                r["label"],
+                r["stock_inicial"],
+                r["entradas"],
+                r["salidas"],
+                r["stock_final"],
+            ))
+
+    def _graficar(self, filas):
+        # Limpiar gráfica anterior
+        for w in self._graf_frame.winfo_children():
+            w.destroy()
+        if self._fig:
+            plt.close(self._fig)
+
+        if not filas:
+            return
+
+        labels       = [r["label"]       for r in filas]
+        stock_final  = [r["stock_final"]  for r in filas]
+        entradas     = [r["entradas"]     for r in filas]
+        salidas      = [r["salidas"]      for r in filas]
+
+        bg   = C["graf_bg"]
+        self._fig, ax = plt.subplots(figsize=(6, 4))
+        self._fig.patch.set_facecolor(bg)
+        ax.set_facecolor(bg)
+
+        xs = range(len(labels))
+        ax.bar(xs, entradas, color="#27ae60", alpha=0.6, label="Entradas")
+        ax.bar(xs, [-s for s in salidas], color="#e74c3c", alpha=0.6, label="Salidas")
+        ax.plot(xs, stock_final, color=C["inv"], marker="o", linewidth=2,
+                label="Stock Proyectado")
+        ax.axhline(0, color=C["ss"], linestyle="--", linewidth=1, alpha=0.7)
+
+        ax.set_xticks(list(xs))
+        ax.set_xticklabels(labels, rotation=45, ha="right",
+                           color=C["texto"], fontsize=7)
+        ax.tick_params(colors=C["texto"])
+        ax.yaxis.label.set_color(C["texto"])
+        ax.spines["bottom"].set_color(C["grid"])
+        ax.spines["left"].set_color(C["grid"])
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_title("Proyección de Inventario", color=C["verde"], fontsize=10)
+        ax.legend(facecolor=C["panel"], edgecolor=C["grid"],
+                  labelcolor=C["texto"], fontsize=8)
+        self._fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(self._fig, master=self._graf_frame)
+        canvas.draw()
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._canvas = canvas
+
+    def refresh(self):
+        self._skus       = db.get_skus()
+        self._sku_labels = [f"{s['codigo']} — {s['descripcion']}" for s in self._skus]
+        self._sku_ids    = [s["id"] for s in self._skus]
+        self._cb_sku["values"] = self._sku_labels
+        if self._sku_labels and self.vSKU.get() not in self._sku_labels:
+            self.vSKU.set(self._sku_labels[0])
+
+    def _exportar(self):
+        if not self._proyeccion:
+            messagebox.showinfo("Sin datos", "Ejecute la proyección primero."); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="Exportar Proyección de Inventario"
+        )
+        if path:
+            pd.DataFrame(self._proyeccion).to_csv(path, index=False)
+            messagebox.showinfo("Exportado", f"Proyección exportada en:\n{path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Tab Inventario principal
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -318,11 +515,14 @@ class TabInventario(ttk.Frame):
         self._tab_stock    = _TabStock(nb)
         self._tab_alertas  = _TabAlertas(nb)
         self._tab_importar = _TabImportarCSV(nb)
+        self._tab_proyec   = _TabProyeccionInventario(nb)
 
         nb.add(self._tab_stock,    text="  📦 Stock Actual  ")
         nb.add(self._tab_alertas,  text="  ⚠ Alertas  ")
         nb.add(self._tab_importar, text="  📂 Importar CSV  ")
+        nb.add(self._tab_proyec,   text="  📈 Proyección  ")
 
     def refresh_all(self):
         self._tab_stock.refresh()
         self._tab_alertas.refresh()
+        self._tab_proyec.refresh()

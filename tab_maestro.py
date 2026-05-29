@@ -769,27 +769,41 @@ class _TabClientes(ttk.Frame):
         self._build()
 
     def _build(self):
-        COLS = ("ID", "Nombre", "Tipo", "Demanda Anual", "SKU Asociado")
-        toolbar = crud_toolbar(self, on_add=self._add, on_edit=self._edit, on_delete=self._delete,
-                                tip_add="Registrar un cliente con su demanda anual y SKU de referencia.",
-                                tip_edit="Editar los datos del cliente seleccionado.",
-                                tip_del="Eliminar el cliente del catálogo.")
+        COLS = ("ID", "Nombre", "Tipo", "Demanda Anual", "SKU Asociado", "# Productos")
+        toolbar = crud_toolbar(
+            self,
+            on_add=self._add,
+            on_edit=self._edit,
+            on_delete=self._delete,
+            extras=[("📋 Consumo de Productos", self._consumo)],
+            tip_add="Registrar un cliente con su demanda anual y SKU de referencia.",
+            tip_edit="Editar los datos del cliente seleccionado.",
+            tip_del="Eliminar el cliente del catálogo.",
+            tips_extras=["Gestionar los productos que consume este cliente con su demanda anual por producto."],
+        )
         toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
         frm_tv, self._tv = make_treeview(self, COLS)
         frm_tv.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        self._tv.column("ID", width=40)
-        self._tv.column("Nombre", width=180)
-        self._tv.column("Tipo", width=80)
+        self._tv.column("ID",           width=40)
+        self._tv.column("Nombre",       width=170)
+        self._tv.column("Tipo",         width=80)
         self._tv.column("Demanda Anual", width=110)
-        self._tv.column("SKU Asociado", width=120)
+        self._tv.column("SKU Asociado", width=110)
+        self._tv.column("# Productos",  width=90)
         self.refresh()
 
     def refresh(self):
+        # Mapa de cuenta de productos por cliente desde cliente_consumo
+        cc_count = {}
+        for cc in db.get_cliente_consumo():
+            cc_count[cc["cliente_id"]] = cc_count.get(cc["cliente_id"], 0) + 1
+
         self._tv.delete(*self._tv.get_children())
         for r in db.get_clientes():
             self._tv.insert("", "end", values=(
                 r["id"], r["nombre"], r["tipo"],
-                r["demanda_anual"], r["sku_codigo"] or ""
+                r["demanda_anual"], r["sku_codigo"] or "",
+                cc_count.get(r["id"], 0)
             ))
 
     def _selected_data(self):
@@ -835,6 +849,171 @@ class _TabClientes(ttk.Frame):
         if not data: return
         if messagebox.askyesno("Confirmar", f"¿Eliminar cliente '{data['nombre']}'?"):
             db.delete_cliente(data["id"])
+            self.refresh()
+
+    def _consumo(self):
+        data = self._selected_data()
+        if not data: return
+        win = _ClienteConsumoWindow(self.winfo_toplevel(), data)
+        self.winfo_toplevel().wait_window(win)
+        self.refresh()
+
+
+# ─── Ventana de gestión de consumo de productos por cliente ───────────────────
+
+class _ClienteConsumoItemDialog(SimpleDialog):
+    """Diálogo para agregar/editar un producto consumido por un cliente."""
+
+    def __init__(self, parent, cliente_nombre, skus, data=None):
+        self._data            = data or {}
+        self._skus            = skus
+        self._cliente_nombre  = cliente_nombre
+        super().__init__(parent, f"Consumo — {cliente_nombre}")
+
+    def _build_form(self):
+        f = tk.Frame(self, bg=C["bg"], padx=14, pady=10)
+        f.pack(fill="both")
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text=f"Cliente: {self._cliente_nombre}",
+                  style="Sub.TLabel").grid(row=0, column=0, columnspan=2,
+                                            sticky="w", padx=10, pady=(0, 6))
+
+        ttk.Label(f, text="Producto :", style="In.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(10, 4), pady=3)
+        self._sku_labels = [f"{s['codigo']} — {s['descripcion']}" for s in self._skus]
+        self._sku_ids    = [s["id"] for s in self._skus]
+        self.vSKU = tk.StringVar()
+        cur_id = self._data.get("sku_id")
+        if cur_id and cur_id in self._sku_ids:
+            self.vSKU.set(self._sku_labels[self._sku_ids.index(cur_id)])
+        elif self._sku_labels:
+            self.vSKU.set(self._sku_labels[0])
+        cb = ttk.Combobox(f, textvariable=self.vSKU, values=self._sku_labels,
+                           state="readonly", width=28)
+        cb.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=3)
+        if self._data:              # editando → no cambiar el SKU
+            cb.config(state="disabled")
+
+        self.vDemanda = _entry_row(f, "Demanda anual :", self._data.get("demanda_anual", 0), 2)
+        self.vUnidad  = _entry_row(f, "Unidad :",        self._data.get("unidad", "unidad"),  3)
+
+        ttk.Label(f, text="La demanda anual se usa para calcular consumos por período\n"
+                           "y proyecciones de inventario via BOM.",
+                  style="Dim.TLabel").grid(row=4, column=0, columnspan=2,
+                                            sticky="w", padx=10, pady=(2, 0))
+
+    def _get_values(self):
+        if not self._sku_ids:
+            raise ValueError("No hay SKUs disponibles. Cree primero un SKU.")
+        idx = self._sku_labels.index(self.vSKU.get()) if self.vSKU.get() in self._sku_labels else 0
+        return {
+            "sku_id":        self._sku_ids[idx],
+            "demanda_anual": _flt(self.vDemanda, "Demanda anual", 0),
+            "unidad":        self.vUnidad.get().strip() or "unidad",
+        }
+
+
+class _ClienteConsumoWindow(tk.Toplevel):
+    """Ventana para gestionar los productos consumidos por un cliente."""
+
+    def __init__(self, parent, cliente):
+        super().__init__(parent)
+        self.title(f"Consumo de Productos — {cliente['nombre']}")
+        self.geometry("680x420")
+        self.configure(bg=C["bg"])
+        self._cliente = cliente
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        COLS = ("ID", "Producto (SKU)", "Descripción", "Demanda Anual", "Unidad")
+        toolbar = crud_toolbar(
+            self,
+            on_add=self._add,
+            on_edit=self._edit,
+            on_delete=self._delete,
+            tip_add="Agregar un producto que consume este cliente con su demanda anual.",
+            tip_edit="Editar la demanda anual del producto seleccionado.",
+            tip_del="Quitar este producto del consumo del cliente.",
+        )
+        toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+
+        frm_tv, self._tv = make_treeview(self, COLS, height=12)
+        frm_tv.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 2))
+        self._tv.column("ID",             width=40)
+        self._tv.column("Producto (SKU)", width=110)
+        self._tv.column("Descripción",    width=200)
+        self._tv.column("Demanda Anual",  width=110)
+        self._tv.column("Unidad",         width=80)
+
+        self._lbl_total = ttk.Label(self, text="", style="Dim.TLabel")
+        self._lbl_total.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
+
+        self.refresh()
+        self.transient(parent)
+        self.grab_set()
+
+    def refresh(self):
+        self._tv.delete(*self._tv.get_children())
+        registros = db.get_cliente_consumo(self._cliente["id"])
+        total = 0.0
+        for r in registros:
+            self._tv.insert("", "end", values=(
+                r["id"], r["sku_codigo"], r["sku_descripcion"],
+                r["demanda_anual"], r["unidad"]
+            ))
+            total += r["demanda_anual"]
+        self._lbl_total.config(
+            text=f"  {len(registros)} producto(s)  |  Demanda anual total: {total:,.0f} unid."
+        )
+
+    def _selected_row(self):
+        sel = self._tv.selection()
+        if not sel:
+            messagebox.showwarning("Selección", "Seleccione un registro."); return None
+        v = self._tv.item(sel[0])["values"]
+        # Reconstruir sku_id buscando por código
+        sku_id = None
+        for s in db.get_skus():
+            if s["codigo"] == v[1]:
+                sku_id = s["id"]; break
+        return {"id": v[0], "sku_id": sku_id, "sku_codigo": v[1],
+                "demanda_anual": v[3], "unidad": v[4]}
+
+    def _add(self):
+        skus = db.get_skus()
+        if not skus:
+            messagebox.showinfo("Sin SKUs", "Primero cree SKUs en la pestaña Maestro."); return
+        dlg = _ClienteConsumoItemDialog(
+            self, self._cliente["nombre"], skus)
+        res = dlg.wait()
+        if res:
+            try:
+                db.add_cliente_consumo(self._cliente["id"], **res)
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def _edit(self):
+        row = self._selected_row()
+        if not row: return
+        skus = db.get_skus()
+        dlg  = _ClienteConsumoItemDialog(
+            self, self._cliente["nombre"], skus, row)
+        res  = dlg.wait()
+        if res:
+            try:
+                db.update_cliente_consumo(row["id"], res["demanda_anual"], res["unidad"])
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def _delete(self):
+        row = self._selected_row()
+        if not row: return
+        if messagebox.askyesno("Confirmar",
+                                f"¿Quitar '{row['sku_codigo']}' del consumo de este cliente?"):
+            db.delete_cliente_consumo(row["id"])
             self.refresh()
 
 

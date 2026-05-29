@@ -4,9 +4,10 @@ database.py — Capa de persistencia SQLite
 Schema + helpers CRUD para el Sistema ERP-Inventario.
 """
 
+import math
 import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DB_PATH = Path(__file__).parent / "inventario.db"
 
@@ -130,6 +131,15 @@ def init_db():
             unidad          TEXT    DEFAULT 'unidad',
             precio_unitario REAL    DEFAULT 0,
             subtotal        REAL    DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS cliente_consumo (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            cliente_id    INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+            sku_id        INTEGER NOT NULL REFERENCES skus(id) ON DELETE CASCADE,
+            demanda_anual REAL    DEFAULT 0,
+            unidad        TEXT    DEFAULT 'unidad',
+            UNIQUE(cliente_id, sku_id)
         );
         """)
     _run_migrations()
@@ -370,6 +380,227 @@ def get_demanda_total_sku(sku_id):
     return row["total"] if row else 0
 
 
+# ─── Cliente Consumo (relación N:M cliente ↔ producto) ────────────────────────
+
+def get_cliente_consumo(cliente_id=None):
+    """Retorna los productos que consume un cliente (o todos si cliente_id=None)."""
+    if cliente_id:
+        return fetchall(
+            "SELECT cc.*, c.nombre AS cliente_nombre, "
+            "s.codigo AS sku_codigo, s.descripcion AS sku_descripcion, s.unidad AS sku_unidad "
+            "FROM cliente_consumo cc "
+            "JOIN clientes c ON c.id=cc.cliente_id "
+            "JOIN skus s ON s.id=cc.sku_id "
+            "WHERE cc.cliente_id=? ORDER BY s.codigo",
+            (cliente_id,)
+        )
+    return fetchall(
+        "SELECT cc.*, c.nombre AS cliente_nombre, "
+        "s.codigo AS sku_codigo, s.descripcion AS sku_descripcion, s.unidad AS sku_unidad "
+        "FROM cliente_consumo cc "
+        "JOIN clientes c ON c.id=cc.cliente_id "
+        "JOIN skus s ON s.id=cc.sku_id "
+        "ORDER BY c.nombre, s.codigo"
+    )
+
+
+def add_cliente_consumo(cliente_id, sku_id, demanda_anual=0, unidad="unidad"):
+    return execute(
+        "INSERT OR IGNORE INTO cliente_consumo(cliente_id,sku_id,demanda_anual,unidad) "
+        "VALUES(?,?,?,?)",
+        (cliente_id, sku_id, demanda_anual, unidad)
+    )
+
+
+def update_cliente_consumo(cc_id, demanda_anual, unidad):
+    execute(
+        "UPDATE cliente_consumo SET demanda_anual=?,unidad=? WHERE id=?",
+        (demanda_anual, unidad, cc_id)
+    )
+
+
+def delete_cliente_consumo(cc_id):
+    execute("DELETE FROM cliente_consumo WHERE id=?", (cc_id,))
+
+
+def get_consumo_resumen_por_sku():
+    """
+    Retorna demanda_anual total agrupada por sku, sumando todos los clientes.
+    Útil para alimentar los cálculos EOQ con demanda real de clientes.
+    """
+    return fetchall(
+        "SELECT cc.sku_id, SUM(cc.demanda_anual) AS demanda_total, "
+        "s.codigo, s.descripcion "
+        "FROM cliente_consumo cc JOIN skus s ON s.id=cc.sku_id "
+        "GROUP BY cc.sku_id ORDER BY s.codigo"
+    )
+
+
+# ─── Simulación de consumo por período (BOM + cliente_consumo) ────────────────
+
+def simular_consumo_periodos(n_periodos=12, tipo_periodo="mes"):
+    """
+    Simula el consumo de componentes por período usando demanda de clientes
+    (tabla cliente_consumo) y explota el BOM con math.ceil en cada nivel.
+
+    tipo_periodo: 'mes' (12/año) | 'semana' (52/año)
+
+    Retorna lista de dicts:
+      periodo, sku_id, sku_codigo, sku_descripcion, demanda_periodo,
+      comp_codigo, comp_descripcion, cantidad_requerida, unidad, nivel
+    """
+    divisor = 12 if tipo_periodo == "mes" else 52
+
+    consumos = fetchall(
+        "SELECT cc.sku_id, SUM(cc.demanda_anual) AS demanda_total, "
+        "s.codigo, s.descripcion "
+        "FROM cliente_consumo cc JOIN skus s ON s.id=cc.sku_id "
+        "GROUP BY cc.sku_id"
+    )
+
+    resultado = []
+    for per in range(1, n_periodos + 1):
+        for cons in consumos:
+            demanda_periodo = math.ceil(cons["demanda_total"] / divisor)
+            componentes = explotar_bom(cons["sku_id"], demanda_periodo)
+            if componentes:
+                for comp in componentes:
+                    resultado.append({
+                        "periodo":            per,
+                        "sku_id":             cons["sku_id"],
+                        "sku_codigo":         cons["codigo"],
+                        "sku_descripcion":    cons["descripcion"],
+                        "demanda_periodo":    demanda_periodo,
+                        "comp_codigo":        comp["codigo"],
+                        "comp_descripcion":   comp["descripcion"],
+                        "cantidad_requerida": comp["cantidad_total"],
+                        "unidad":             comp["unidad"],
+                        "nivel":              comp["nivel"],
+                    })
+            else:
+                # Sin BOM → el producto mismo es lo que se demanda
+                resultado.append({
+                    "periodo":            per,
+                    "sku_id":             cons["sku_id"],
+                    "sku_codigo":         cons["codigo"],
+                    "sku_descripcion":    cons["descripcion"],
+                    "demanda_periodo":    demanda_periodo,
+                    "comp_codigo":        cons["codigo"],
+                    "comp_descripcion":   cons["descripcion"],
+                    "cantidad_requerida": demanda_periodo,
+                    "unidad":             "unidad",
+                    "nivel":              0,
+                })
+    return resultado
+
+
+# ─── Proyección de inventario (stock + pedidos + demanda) ─────────────────────
+
+def proyectar_inventario(sku_id, n_periodos=12, tipo_periodo="mes"):
+    """
+    Proyecta el nivel de inventario de un SKU para los próximos N períodos.
+
+    Entradas por período: pedidos pendientes cuyo lead_time los hace llegar
+    en ese período (fecha_orden + lead_time_proveedor).
+    Salidas por período: math.ceil(demanda_anual / divisor), donde demanda
+    proviene de cliente_consumo (demanda directa) más demanda derivada por BOM
+    (este SKU es componente de otro producto consumido por clientes).
+
+    Retorna lista de dicts:
+      periodo, label, stock_inicial, entradas, salidas, stock_final
+    """
+    divisor = 12 if tipo_periodo == "mes" else 52
+    hoy = datetime.now()
+
+    sku = fetchone("SELECT * FROM skus WHERE id=?", (sku_id,))
+    if not sku:
+        return []
+
+    # Demanda directa (clientes consumen este SKU como producto final)
+    row = fetchone(
+        "SELECT COALESCE(SUM(demanda_anual), 0) AS total "
+        "FROM cliente_consumo WHERE sku_id=?",
+        (sku_id,)
+    )
+    demanda_directa = math.ceil((row["total"] if row else 0) / divisor)
+
+    # Demanda derivada (este SKU es componente en el BOM de otro producto)
+    prod_links = fetchall(
+        "SELECT b.producto_id, b.cantidad AS qty_por_producto "
+        "FROM bom b WHERE b.componente_id=?",
+        (sku_id,)
+    )
+    demanda_derivada = 0
+    for link in prod_links:
+        r2 = fetchone(
+            "SELECT COALESCE(SUM(demanda_anual), 0) AS total "
+            "FROM cliente_consumo WHERE sku_id=?",
+            (link["producto_id"],)
+        )
+        dem_padre = (r2["total"] if r2 else 0) / divisor
+        demanda_derivada += math.ceil(dem_padre * link["qty_por_producto"])
+
+    salidas_periodo = demanda_directa + demanda_derivada
+
+    # Pedidos pendientes → calcular período de llegada
+    entradas_por_periodo: dict[int, float] = {}
+    pedidos = fetchall(
+        "SELECT p.cantidad, p.fecha_orden, COALESCE(pr.lead_time, 0) AS lead_time "
+        "FROM pedidos p "
+        "LEFT JOIN proveedores pr ON pr.id=p.proveedor_id "
+        "WHERE p.sku_id=? AND p.estado='pendiente'",
+        (sku_id,)
+    )
+    for ped in pedidos:
+        try:
+            dt_ord = datetime.strptime(str(ped["fecha_orden"]), "%Y-%m-%d")
+        except Exception:
+            dt_ord = hoy
+        dt_llegada = dt_ord + timedelta(days=int(ped["lead_time"]))
+
+        if tipo_periodo == "mes":
+            delta = (dt_llegada.year - hoy.year) * 12 + (dt_llegada.month - hoy.month)
+            per_llegada = delta + 1
+        else:
+            delta_dias = (dt_llegada - hoy).days
+            per_llegada = max(1, (delta_dias // 7) + 1)
+
+        if 1 <= per_llegada <= n_periodos:
+            entradas_por_periodo[per_llegada] = (
+                entradas_por_periodo.get(per_llegada, 0) + ped["cantidad"]
+            )
+
+    # Construir proyección período a período
+    proyeccion = []
+    stock = sku["stock_actual"]
+
+    for per in range(1, n_periodos + 1):
+        if tipo_periodo == "mes":
+            mes_abs  = hoy.month + per - 1
+            anio_per = hoy.year + (mes_abs - 1) // 12
+            mes_per  = ((mes_abs - 1) % 12) + 1
+            label    = f"{anio_per}-{mes_per:02d}"
+        else:
+            dt_per = hoy + timedelta(weeks=per - 1)
+            label  = f"S{per:02d}-{dt_per.year}"
+
+        entradas      = math.ceil(entradas_por_periodo.get(per, 0))
+        stock_inicial = round(stock, 2)
+        stock_final   = round(stock + entradas - salidas_periodo, 2)
+
+        proyeccion.append({
+            "periodo":       per,
+            "label":         label,
+            "stock_inicial": stock_inicial,
+            "entradas":      entradas,
+            "salidas":       salidas_periodo,
+            "stock_final":   stock_final,
+        })
+        stock = stock_final
+
+    return proyeccion
+
+
 # ─── Pedidos ──────────────────────────────────────────────────────────────────
 
 def get_pedidos():
@@ -498,16 +729,18 @@ def delete_bom(bom_id):
 
 def explotar_bom(producto_id, cantidad_requerida=1):
     """
-    Explota el BOM multi-nivel del producto.
+    Explota el BOM multi-nivel del producto aplicando math.ceil en cada nivel
+    (redondeo al entero superior cuando la cantidad resulta decimal).
     Retorna lista de {componente_id, codigo, descripcion, cantidad_total, nivel}.
     """
     items = {}
+    cantidad_requerida = math.ceil(cantidad_requerida)
 
     def _recur(pid, qty, nivel):
         filas = get_bom(pid)
         for f in filas:
             cid = f["componente_id"]
-            total_qty = qty * f["cantidad"]
+            total_qty = math.ceil(qty * f["cantidad"])
             if cid in items:
                 items[cid]["cantidad_total"] += total_qty
             else:
